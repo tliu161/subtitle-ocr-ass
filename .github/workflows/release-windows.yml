@@ -1,67 +1,78 @@
-name: Build Windows Release
+name: Windows Release
 
 on:
   push:
-    tags:
-      - "v*"
-
-permissions:
-  contents: write
+    branches: [main]
+  workflow_dispatch:
 
 jobs:
   build-windows:
     runs-on: windows-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
       - name: Install dependencies
-        shell: pwsh
         run: |
-          python -m pip install --upgrade pip
           pip install -r requirements-release.txt
-          pip install pyinstaller
 
-      - name: Build with PyInstaller spec
+      # --------------------------------------------------
+      # ✅ Download ffmpeg / ffprobe / ffplay
+      # --------------------------------------------------
+      - name: Download ffmpeg (Windows static)
         shell: pwsh
         run: |
-          pyinstaller --noconfirm --clean SubtitleOCR_ASS.spec
+          New-Item -ItemType Directory -Force bin | Out-Null
 
-      - name: Add README.txt into dist
+          $url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+          $zip = "ffmpeg.zip"
+
+          Write-Host "Downloading ffmpeg..."
+          Invoke-WebRequest $url -OutFile $zip
+
+          Write-Host "Extracting..."
+          Expand-Archive $zip -DestinationPath ffmpeg_tmp -Force
+
+          $exeDir = Get-ChildItem ffmpeg_tmp | Select-Object -First 1 | ForEach-Object {
+            Join-Path $_.FullName "bin"
+          }
+
+          Copy-Item "$exeDir\ffmpeg.exe"  "bin\ffmpeg.exe"  -Force
+          Copy-Item "$exeDir\ffprobe.exe" "bin\ffprobe.exe" -Force
+          Copy-Item "$exeDir\ffplay.exe"  "bin\ffplay.exe"  -Force
+
+          Remove-Item ffmpeg_tmp -Recurse -Force
+          Remove-Item $zip -Force
+
+          Write-Host "ffmpeg binaries ready:"
+          Get-ChildItem bin
+
+      # --------------------------------------------------
+      # Build with PyInstaller
+      # --------------------------------------------------
+      - name: Build Windows exe
+        run: |
+          pyinstaller SubtitleOCR_ASS.spec
+
+      # --------------------------------------------------
+      # Zip release
+      # --------------------------------------------------
+      - name: Zip artifact
         shell: pwsh
         run: |
-          $readme = @"
-SubtitleOCR_ASS (Windows)
-
-1) Double-click SubtitleOCR_ASS.exe
-2) Select Video
-3) Use slider to pick a time with subtitles
-4) Drag a red box to cover subtitle region
-5) Click Run OCR → ASS
-
-Output: <your_video>_tc.ass will be created next to your video file.
-First run may take longer.
-"@
-          $readme | Out-File -Encoding utf8 dist/SubtitleOCR_ASS/README.txt
-
-      - name: Zip release folder
-        shell: pwsh
-        run: |
-          Compress-Archive -Path dist/SubtitleOCR_ASS -DestinationPath SubtitleOCR_ASS-windows.zip -Force
+          Compress-Archive -Path dist/SubtitleOCR_ASS -DestinationPath SubtitleOCR_ASS-windows.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: SubtitleOCR_ASS-windows
           path: SubtitleOCR_ASS-windows.zip
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: SubtitleOCR_ASS-windows.zip
