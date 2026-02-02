@@ -5,7 +5,7 @@ import shutil
 import sys
 import types
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Callable
 
 import cv2
 from tqdm import tqdm
@@ -129,17 +129,24 @@ def ass_time(t: float) -> str:
                 h += 1
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
+def extract_frames(video: str, frames_dir: str, sample_fps: float, progress_cb=None):
+    if progress_cb:
+        progress_cb("extract", 0.0, "Extracting frames…")
 
-def extract_frames(video: str, frames_dir: str, sample_fps: float):
     if os.path.exists(frames_dir):
         shutil.rmtree(frames_dir)
     os.makedirs(frames_dir, exist_ok=True)
+
     run_cmd([
         "ffmpeg", "-y",
         "-i", video,
         "-vf", f"fps={sample_fps}",
         os.path.join(frames_dir, "frame_%06d.png")
     ])
+
+    if progress_cb:
+        progress_cb("extract", 1.0, "Extracting frames… done")
+
 
 
 def roi_crop(img, custom: Tuple[int, int, int, int]):
@@ -203,8 +210,7 @@ def pick_best_text_and_pos(ocr_result, x_off: int, y_off: int) -> Tuple[str, Tup
     cx = int((min(xs) + max(xs)) / 2) + x_off
     cy = int((min(ys) + max(ys)) / 2) + y_off
     return merged_text, (cx, cy)
-
-
+    
 def build_items(
     frames_dir: str,
     sample_fps: float,
@@ -212,6 +218,8 @@ def build_items(
     change_threshold: float,
     opencc: OpenCC,
     debug_first_n: int = 0,
+    progress_cb=None,
+    progress_every: int = 5,   # 每 5 張回報一次，避免 UI 太頻繁
 ) -> List[Item]:
     install_import_shims()
     from paddleocr import PaddleOCR  # delayed import
@@ -219,8 +227,13 @@ def build_items(
     ocr = PaddleOCR(use_angle_cls=False, lang="ch", show_log=False)
 
     frame_files = sorted([f for f in os.listdir(frames_dir) if f.lower().endswith(".png")])
+    total = max(len(frame_files), 1)
+
     items: List[Item] = []
     prev_text_sc: Optional[str] = None
+
+    if progress_cb:
+        progress_cb("ocr", 0.0, f"OCR frames… (0/{total})")
 
     for i, fn in enumerate(tqdm(frame_files, desc="OCR frames")):
         t = i / sample_fps
@@ -239,21 +252,27 @@ def build_items(
 
         if not text_sc:
             prev_text_sc = text_sc
-            continue
+        else:
+            text_tc = opencc.convert(text_sc)
 
-        text_tc = opencc.convert(text_sc)
+            if prev_text_sc:
+                maxlen = max(len(prev_text_sc), len(text_sc), 1)
+                dist = Levenshtein.distance(prev_text_sc, text_sc) / maxlen
+                if dist < change_threshold:
+                    items.append(Item(t=t, text_sc=prev_text_sc, text_tc=opencc.convert(prev_text_sc), pos=pos))
+                else:
+                    items.append(Item(t=t, text_sc=text_sc, text_tc=text_tc, pos=pos))
+                    prev_text_sc = text_sc
+            else:
+                items.append(Item(t=t, text_sc=text_sc, text_tc=text_tc, pos=pos))
+                prev_text_sc = text_sc
 
-        if prev_text_sc:
-            maxlen = max(len(prev_text_sc), len(text_sc), 1)
-            dist = Levenshtein.distance(prev_text_sc, text_sc) / maxlen
-            if dist < change_threshold:
-                items.append(Item(t=t, text_sc=prev_text_sc, text_tc=opencc.convert(prev_text_sc), pos=pos))
-                continue
-
-        items.append(Item(t=t, text_sc=text_sc, text_tc=text_tc, pos=pos))
-        prev_text_sc = text_sc
+        # ---- progress update ----
+        if progress_cb and (i % progress_every == 0 or i == total - 1):
+            progress_cb("ocr", (i + 1) / total, f"OCR frames… ({i+1}/{total})")
 
     return items
+
 
 
 def items_to_segments(items: List[Item], sample_fps: float, hold_gap: float) -> List[Segment]:
@@ -339,7 +358,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     with open(out_path, "w", encoding="utf-8-sig") as f:
         f.write("".join(lines))
 
-
 def process_video_to_ass(
     video_path: str,
     roi_xywh: Tuple[int, int, int, int],
@@ -350,6 +368,7 @@ def process_video_to_ass(
     fill_gaps: float = 2.0,
     keep_frames: bool = False,
     debug_first_n: int = 0,
+    progress_cb=None,
 ) -> str:
     if not os.path.exists(video_path):
         raise FileNotFoundError(video_path)
@@ -362,9 +381,30 @@ def process_video_to_ass(
     print(f"Video: {video_path}  {w}x{h}  {dur:.1f}s")
     print(f"ROI: {roi_xywh}  |  fps={sample_fps}  thr={change_threshold}  hold={hold_gap}  fill={fill_gaps}")
 
-    extract_frames(video_path, frames_dir, sample_fps)
+    # ---- Stage 1: extract frames (0–10%) ----
+    if progress_cb:
+        progress_cb("stage", 0.0, "Stage 1/3: Extracting frames…")
+        progress_cb("overall", 0.0, "Stage 1/3: Extracting frames…")
+
+    def stage_extract_cb(_phase, frac, msg):
+        # map 0..1 -> 0..0.10
+        if progress_cb:
+            progress_cb("overall", 0.10 * frac, msg)
+
+    extract_frames(video_path, frames_dir, sample_fps, progress_cb=stage_extract_cb)
+
+    # ---- Stage 2: OCR (10–95%) ----
+    if progress_cb:
+        progress_cb("stage", 0.0, "Stage 2/3: OCR…")
+        progress_cb("overall", 0.10, "Stage 2/3: OCR…")
 
     cc = OpenCC("s2t")
+
+    def stage_ocr_cb(_phase, frac, msg):
+        # map 0..1 -> 0.10..0.95
+        if progress_cb:
+            progress_cb("overall", 0.10 + 0.85 * frac, msg)
+
     items = build_items(
         frames_dir=frames_dir,
         sample_fps=sample_fps,
@@ -372,14 +412,23 @@ def process_video_to_ass(
         change_threshold=change_threshold,
         opencc=cc,
         debug_first_n=debug_first_n,
+        progress_cb=stage_ocr_cb,
+        progress_every=5,
     )
 
     segments = items_to_segments(items, sample_fps=sample_fps, hold_gap=hold_gap)
     if fill_gaps and fill_gaps > 0:
         segments = fill_gaps_upto(segments, max_gap=fill_gaps)
 
+    # ---- Stage 3: write file (95–100%) ----
+    if progress_cb:
+        progress_cb("stage", 0.0, "Stage 3/3: Writing ASS…")
+        progress_cb("overall", 0.95, "Stage 3/3: Writing ASS…")
+
     write_ass(segments, out_ass, play_res_x=w, play_res_y=h)
-    print(f"✅ Output ASS: {out_ass}  (segments: {len(segments)})")
+
+    if progress_cb:
+        progress_cb("overall", 1.0, "Done ✅")
 
     if not keep_frames:
         shutil.rmtree(frames_dir, ignore_errors=True)
