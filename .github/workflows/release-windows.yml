@@ -1,17 +1,55 @@
-name: Windows Release
+name: Build Windows .exe + Tag + Release
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+        default: "v0.1.0"
+
+permissions:
+  contents: write
 
 jobs:
   build-windows:
     runs-on: windows-latest
 
     steps:
-      - name: Checkout repo
+      - name: Checkout (main)
         uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0  # IMPORTANT: so we can create/push tags
+
+      - name: Create and push tag
+        shell: pwsh
+        run: |
+          $TAG = "${{ github.event.inputs.version }}"
+
+          if ($TAG -notmatch '^v\d+(\.\d+){0,2}([\-+][0-9A-Za-z\.-]+)?$') {
+            Write-Error "Tag must look like v0.1.0 (or v0.1 or v0.1.0-rc1). Got: $TAG"
+            exit 1
+          }
+
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          # Create local tag if missing
+          git rev-parse $TAG 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            git tag $TAG
+          } else {
+            Write-Host "Tag $TAG already exists locally."
+          }
+
+          # Push tag if missing on remote
+          $remoteTags = git ls-remote --tags origin
+          if ($remoteTags -match "refs/tags/$TAG$") {
+            Write-Host "Tag $TAG already exists on origin. Skipping push."
+          } else {
+            git push origin $TAG
+          }
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -24,6 +62,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements-release.txt
+          pip install pyinstaller
 
       # --------------------------------------------------
       # ✅ Download ffmpeg / ffprobe / ffplay
@@ -42,9 +81,8 @@ jobs:
           Write-Host "Extracting..."
           Expand-Archive $zip -DestinationPath ffmpeg_tmp -Force
 
-          $exeDir = Get-ChildItem ffmpeg_tmp | Select-Object -First 1 | ForEach-Object {
-            Join-Path $_.FullName "bin"
-          }
+          $root = (Get-ChildItem ffmpeg_tmp | Select-Object -First 1).FullName
+          $exeDir = Join-Path $root "bin"
 
           Copy-Item "$exeDir\ffmpeg.exe"  "bin\ffmpeg.exe"  -Force
           Copy-Item "$exeDir\ffprobe.exe" "bin\ffprobe.exe" -Force
@@ -57,11 +95,11 @@ jobs:
           Get-ChildItem bin
 
       # --------------------------------------------------
-      # Build with PyInstaller
+      # ✅ Build with PyInstaller (spec)
       # --------------------------------------------------
       - name: Build Windows exe
         run: |
-          pyinstaller SubtitleOCR_ASS.spec
+          pyinstaller --noconfirm --clean SubtitleOCR_ASS.spec
 
       # --------------------------------------------------
       # Zip release
@@ -69,10 +107,23 @@ jobs:
       - name: Zip artifact
         shell: pwsh
         run: |
-          Compress-Archive -Path dist/SubtitleOCR_ASS -DestinationPath SubtitleOCR_ASS-windows.zip
+          if (!(Test-Path "dist/SubtitleOCR_ASS")) {
+            Write-Error "dist/SubtitleOCR_ASS not found"
+            exit 1
+          }
+          Compress-Archive -Path dist/SubtitleOCR_ASS/* -DestinationPath SubtitleOCR_ASS-windows.zip -Force
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: SubtitleOCR_ASS-windows
           path: SubtitleOCR_ASS-windows.zip
+
+      - name: Create/Update GitHub Release (attach zip)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+          name: SubtitleOCR_ASS ${{ github.event.inputs.version }}
+          draft: false
+          prerelease: false
+          files: SubtitleOCR_ASS-windows.zip
