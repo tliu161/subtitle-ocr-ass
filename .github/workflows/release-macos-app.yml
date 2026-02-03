@@ -1,10 +1,12 @@
-name: Build macOS .app (arm64)
+name: Build macOS .app (arm64) + Tag + Release
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+        default: "v0.1.0"
 
 permissions:
   contents: write
@@ -14,8 +16,40 @@ jobs:
     runs-on: macos-14  # Apple Silicon runner
 
     steps:
-      - name: Checkout
+      - name: Checkout (main)
         uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0  # IMPORTANT: so we can create/push tags
+
+      - name: Create and push tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.version }}"
+
+          # Basic validation
+          if [[ ! "$TAG" =~ ^v[0-9]+(\.[0-9]+){0,2}([\-+][0-9A-Za-z\.-]+)?$ ]]; then
+            echo "Tag must look like v0.1.0 (or v0.1 or v0.1.0-rc1). Got: $TAG"
+            exit 1
+          fi
+
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          # If tag already exists locally or remotely, don't fail
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists locally."
+          else
+            git tag "$TAG"
+          fi
+
+          # Push tag if not present on remote
+          if git ls-remote --tags origin | grep -q "refs/tags/$TAG"; then
+            echo "Tag $TAG already exists on origin. Skipping push."
+          else
+            git push origin "$TAG"
+          fi
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -42,7 +76,7 @@ jobs:
           pip install -r requirements-release.txt
           pip install pyinstaller
 
-      # ✅ Key point: --windowed on macOS builds a .app bundle
+      # ✅ Build .app
       - name: Build .app with PyInstaller
         run: |
           pyinstaller --noconfirm --clean --windowed --name SubtitleOCR_ASS app/main.py
@@ -52,20 +86,15 @@ jobs:
           ls -lah dist
           ls -lah "dist/SubtitleOCR_ASS.app" || (echo "Missing .app" && exit 1)
 
-      # Optional: remove quarantine is NOT possible here; we can only sign/notarize for smooth user experience.
-      # Without signing, users can still open via right-click -> Open.
-
       - name: Zip .app for release
         run: |
           ditto -c -k --sequesterRsrc --keepParent "dist/SubtitleOCR_ASS.app" "SubtitleOCR_ASS-macos-arm64.app.zip"
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: SubtitleOCR_ASS-macos-arm64-app
-          path: SubtitleOCR_ASS-macos-arm64.app.zip
-
-      - name: Create GitHub Release (attach zip)
+      - name: Create/Update GitHub Release (attach zip)
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.inputs.version }}
+          name: SubtitleOCR_ASS ${{ github.event.inputs.version }}
+          draft: false
+          prerelease: false
           files: SubtitleOCR_ASS-macos-arm64.app.zip
